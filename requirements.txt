@@ -1,0 +1,6 @@
+kafka-python-ng
+influxdb-client
+numpy
+pandas
+scipy
+matplotlib
