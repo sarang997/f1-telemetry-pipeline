@@ -17,6 +17,7 @@ class TelemetryData:
     lap_time: float
     last_lap_time: float
     sector_name: str
+    timestamp: int
 
     def to_json(self):
         return json.dumps(self.__dict__)

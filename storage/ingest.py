@@ -36,6 +36,24 @@ def run_ingest_worker():
         print(f"Error connecting to InfluxDB: {e}")
         sys.exit(1)
 
+    # Verify Bucket Exists
+    try:
+        buckets_api = client.buckets_api()
+        bucket = buckets_api.find_bucket_by_name(INFLUX_BUCKET)
+        if bucket is None:
+            print(f"Bucket '{INFLUX_BUCKET}' not found. Attempting to create it...")
+            try:
+                buckets_api.create_bucket(bucket_name=INFLUX_BUCKET, org=INFLUX_ORG)
+                print(f"Successfully created bucket '{INFLUX_BUCKET}'.")
+            except Exception as e:
+                print(f"Error: Failed to create bucket '{INFLUX_BUCKET}'.")
+                print(f"Details: {e}")
+                print("Suggestion: Your token might not have permission to create buckets.")
+                print("Action: Create the bucket manually in InfluxDB UI or check permissions.")
+                sys.exit(1)
+    except Exception as check_e:
+        print(f"Warning: Ensure bucket '{INFLUX_BUCKET}' exists. Detection failed: {check_e}")
+
     # Use SYNCHRONOUS write api for reliability (fail fast if DB is down)
     write_api = client.write_api(write_options=SYNCHRONOUS)
     
@@ -60,7 +78,7 @@ def run_ingest_worker():
                 .field("brake", float(data['brake'])) \
                 .field("g_lat", float(data['g_lat'])) \
                 .field("g_long", float(data['g_long'])) \
-                .time(time.time_ns())
+                .time(int(data['timestamp']))
             
             batch.append(p)
             

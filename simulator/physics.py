@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import sys
+import time
 import os
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -171,5 +172,6 @@ class F1Sim:
             lap_count=self.lap_count,
             lap_time=self.lap_time,
             last_lap_time=getattr(self, 'last_lap_time', 0.0),
-            sector_name=self.track.map_names[self.idx]
+            sector_name=self.track.map_names[self.idx],
+            timestamp=int(time.time_ns())
         )
