@@ -66,3 +66,7 @@ def run_transmitter():
 
 if __name__ == "__main__":
     run_transmitter()
+
+
+#TODO
+#Add mechanism to add the sensors to the data (then send the data to the same message )

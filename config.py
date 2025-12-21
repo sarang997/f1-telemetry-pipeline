@@ -18,3 +18,6 @@ INFLUX_URL = "http://localhost:8086"
 INFLUX_TOKEN = "s5IVEsl-zcYdG8vEPsSp667toPP0TcHVG5_XgGESon4M15g-dK7jADd2kJpghAXf5yVuZF2_uCfEk9QFfxJSXA=="
 INFLUX_ORG = "f1"
 INFLUX_BUCKET = "f1-data"
+
+#Mechanism to control the throughput of the data into the kafka 
+#Mechanism to undetstand the performace of the kafka setup. 
