@@ -3,4 +3,5 @@ influxdb-client
 numpy
 pandas
 scipy
-matplotlib
+pyqtgraph
+PySide6

@@ -1,12 +1,10 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.animation import FuncAnimation
-import json
 import sys
 import os
+import json
+import numpy as np
+import pyqtgraph as pg
+from PySide6 import QtCore, QtWidgets, QtGui
 from kafka import KafkaConsumer
-from collections import deque
 from scipy.spatial import cKDTree
 
 # Add parent directory to path
@@ -15,196 +13,224 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_API_VERSION, VISUALIZATION_FPS, VIZ_GROUP_ID
 from simulator.track import SilverstoneTrack
 
-# --- INITIALIZATION ---
-# Load track high-res points to map Distance -> Graph Index
-track = SilverstoneTrack()
-TRACK_POINTS = len(track.x) # Should be ~20000 high-res points
+class DashboardApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        # Load Track
+        self.track = SilverstoneTrack()
+        self.TRACK_POINTS = len(self.track.x)
+        self.tree = cKDTree(np.column_stack((self.track.x, self.track.y)))
+        
+        # Data Buffers
+        self.x_dist = np.linspace(0, self.track.total_length, self.TRACK_POINTS)
+        self.lap_speed = np.full(self.TRACK_POINTS, np.nan)
+        self.ghost_speed = np.full(self.TRACK_POINTS, np.nan)
+        self.lap_throttle = np.full(self.TRACK_POINTS, np.nan)
+        self.lap_brake = np.full(self.TRACK_POINTS, np.nan)
+        
+        self.current_lap_num = -1
+        self.last_idx = -1
+        
+        # Kafka Setup
+        try:
+            self.consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                auto_offset_reset='latest',
+                group_id=VIZ_GROUP_ID,
+                api_version=KAFKA_API_VERSION
+            )
+            print(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
+        except Exception as e:
+            print(f"Kafka Error: {e}")
+            self.consumer = None
 
-# Initialize Kafka Consumer
-try:
-    consumer = KafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-        auto_offset_reset='latest',
-        group_id=VIZ_GROUP_ID, 
-        api_version=KAFKA_API_VERSION
-    )
-    print(f"Connected to Kafka Consumer at {KAFKA_BOOTSTRAP_SERVERS}")
-except Exception as e:
-    print(f"Failed to connect to Kafka: {e}")
-    consumer = None
+        self.init_ui()
+        
+        # Timer for updates
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update)
+        self.timer.start(int(1000 / VISUALIZATION_FPS))
 
-# --- DATA BUFFERS (LAP BASED) ---
-# We map the track 1:1. Since simulation also uses SilverstoneTrack class, 
-# 'idx' from sim matches 'idx' here.
-lap_speed = np.full(TRACK_POINTS, np.nan)
-lap_throttle = np.full(TRACK_POINTS, np.nan)
-lap_brake = np.full(TRACK_POINTS, np.nan)
-lap_rpm = np.full(TRACK_POINTS, np.nan)
+    def init_ui(self):
+        self.setWindowTitle("F1 Telemetry Dashboard (PyQtGraph)")
+        self.resize(1200, 900)
+        self.setStyleSheet("background-color: #0d0d0d; color: #ffffff;")
+        
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QtWidgets.QVBoxLayout(central_widget)
+        
+        # Top Row: Track and Metrics
+        top_layout = QtWidgets.QHBoxLayout()
+        main_layout.addLayout(top_layout, stretch=3)
+        
+        # 1. Track Map
+        self.track_widget = pg.PlotWidget(title="TRACK MAP")
+        self.track_widget.setAspectLocked(True)
+        self.track_widget.showAxis('left', False)
+        self.track_widget.showAxis('bottom', False)
+        self.track_widget.setBackground('#0d0d0d')
+        
+        # Plot Track
+        self.track_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#333333', width=10))
+        self.track_widget.addItem(self.track_line)
+        self.track_center_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#00aaff', width=1, style=QtCore.Qt.DashLine))
+        self.track_widget.addItem(self.track_center_line)
+        
+        # Car Dot
+        self.car_dot = pg.ScatterPlotItem(size=15, brush=pg.mkBrush('#ff0000'), pen=pg.mkPen('w', width=1))
+        self.track_widget.addItem(self.car_dot)
+        
+        top_layout.addWidget(self.track_widget, stretch=2)
+        
+        # 2. Metrics (Timing & G-Force)
+        metrics_layout = QtWidgets.QVBoxLayout()
+        top_layout.addLayout(metrics_layout, stretch=1)
+        
+        # Timing Panel
+        self.timing_label = QtWidgets.QLabel("CURRENT LAP\n--:--.---\n\nLAST LAP\n--:--.---")
+        self.timing_label.setStyleSheet("font-family: 'Courier New'; font-size: 24px; font-weight: bold; color: #00ff00;")
+        self.timing_label.setAlignment(QtCore.Qt.AlignCenter)
+        metrics_layout.addWidget(self.timing_label)
+        
+        # G-Force Plot
+        self.gg_widget = pg.PlotWidget(title="G-FORCE")
+        self.gg_widget.setXRange(-5, 5)
+        self.gg_widget.setYRange(-5, 5)
+        self.gg_widget.setAspectLocked(True)
+        self.gg_widget.setBackground('#1a1a1a')
+        self.gg_widget.addLine(x=0, pen='#333333')
+        self.gg_widget.addLine(y=0, pen='#333333')
+        
+        # Circle at 4G
+        theta = np.linspace(0, 2*np.pi, 100)
+        cx = 4 * np.cos(theta)
+        cy = 4 * np.sin(theta)
+        self.gg_circle = pg.PlotCurveItem(cx, cy, pen=pg.mkPen('#555555', width=1))
+        self.gg_widget.addItem(self.gg_circle)
+        
+        self.gg_dot = pg.ScatterPlotItem(size=12, brush=pg.mkBrush('#00aaff'), pen=pg.mkPen('w', width=1))
+        self.gg_widget.addItem(self.gg_dot)
+        metrics_layout.addWidget(self.gg_widget)
+        
+        # Gear / RPM
+        self.engine_label = QtWidgets.QLabel("GEAR: N\n0 RPM")
+        self.engine_label.setStyleSheet("font-family: 'Impact'; font-size: 40px; color: #ffff00;")
+        self.engine_label.setAlignment(QtCore.Qt.AlignCenter)
+        metrics_layout.addWidget(self.engine_label)
+        
+        # Middle: Speed Trace
+        self.speed_widget = pg.PlotWidget(title="SPEED (km/h)")
+        self.speed_widget.setYRange(0, 360)
+        self.speed_widget.setXRange(0, self.track.total_length)
+        self.speed_widget.setBackground('#1a1a1a')
+        self.speed_widget.showGrid(x=True, y=True, alpha=0.3)
+        
+        self.ghost_line = pg.PlotCurveItem(pen=pg.mkPen('#444444', width=2, style=QtCore.Qt.DashLine))
+        self.speed_line = pg.PlotCurveItem(pen=pg.mkPen('#00aaff', width=3))
+        self.speed_widget.addItem(self.ghost_line)
+        self.speed_widget.addItem(self.speed_line)
+        
+        self.speed_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', width=1, style=QtCore.Qt.DotLine))
+        self.speed_widget.addItem(self.speed_cursor)
+        
+        main_layout.addWidget(self.speed_widget, stretch=1.5)
+        
+        # Bottom: Pedal Traces
+        self.pedal_widget = pg.PlotWidget(title="PEDALS")
+        self.pedal_widget.setYRange(-0.1, 1.1)
+        self.pedal_widget.setXRange(0, self.track.total_length)
+        self.pedal_widget.setBackground('#1a1a1a')
+        self.pedal_widget.showGrid(x=True, y=True, alpha=0.3)
+        
+        self.throttle_line = pg.PlotCurveItem(pen=pg.mkPen('#00ff00', width=2))
+        self.brake_line = pg.PlotCurveItem(pen=pg.mkPen('#ff0000', width=2))
+        self.pedal_widget.addItem(self.throttle_line)
+        self.pedal_widget.addItem(self.brake_line)
+        
+        self.pedal_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', width=1, style=QtCore.Qt.DotLine))
+        self.pedal_widget.addItem(self.pedal_cursor)
+        
+        main_layout.addWidget(self.pedal_widget, stretch=1.5)
 
-# Ghost Lap (Previous Lap)
-ghost_speed = np.full(TRACK_POINTS, np.nan)
+    def update(self):
+        if not self.consumer:
+            return
 
-current_lap_num = -1
-last_idx = -1
+        msgs = self.consumer.poll(timeout_ms=0, max_records=50)
+        if not msgs:
+            return
 
-# --- PLOT SETUP ---
-plt.style.use('dark_background')
-fig = plt.figure(figsize=(16, 12), facecolor='#0d0d0d')
-fig.suptitle('F1 TELEMETRY: LIVE TIMING', color='white', fontsize=20, fontweight='bold', y=0.98)
-
-# 4 Rows: Map, Gauges, Speed, Pedals
-gs = gridspec.GridSpec(4, 2, height_ratios=[3, 1, 1.5, 1.5], width_ratios=[1, 1])
-
-# 1. TRACK MAP (Row 0)
-ax_map = fig.add_subplot(gs[0, 0])
-ax_map.set_facecolor('#0d0d0d')
-ax_map.plot(track.x, track.y, color='#333333', linewidth=12, alpha=0.8)
-ax_map.plot(track.x, track.y, color='#00aaff', linewidth=2, linestyle='--', alpha=0.5)
-dot, = ax_map.plot([], [], 'ro', markersize=18, markeredgecolor='white', markeredgewidth=3, zorder=5)
-ax_map.axis('equal')
-ax_map.axis('off')
-
-# 2. TIMING & INFO (Row 0 Right)
-ax_text = fig.add_subplot(gs[0, 1])
-ax_text.set_facecolor('#0d0d0d')
-ax_text.axis('off')
-txt_curr_lbl = ax_text.text(0.1, 0.75, "CURRENT LAP", color='#888888', fontsize=14)
-txt_curr_val = ax_text.text(0.1, 0.60, "--:--.---", color='white', fontsize=40, fontweight='bold', fontfamily='monospace')
-txt_time_lbl = ax_text.text(0.1, 0.40, "LAST LAP", color='#888888', fontsize=14)
-txt_time_val = ax_text.text(0.1, 0.25, "--:--.---", color='#00ff00', fontsize=40, fontweight='bold', fontfamily='monospace')
-txt_sector = ax_text.text(0.1, 0.05, "SECTOR --", color='#00aaff', fontsize=18, fontstyle='italic')
-
-# 3. GAUGES (Row 1)
-# GG (Left)
-ax_gg = fig.add_subplot(gs[1, 0])
-ax_gg.set_facecolor('#1a1a1a')
-ax_gg.set_xlim(-5, 5)
-ax_gg.set_ylim(-5, 5)
-ax_gg.grid(True, color='#333333', linestyle='--', linewidth=1)
-ax_gg.set_xticks([])
-ax_gg.set_yticks([])
-circle1 = plt.Circle((0, 0), 4, color='#555555', fill=False, linewidth=2)
-ax_gg.add_patch(circle1)
-dot_gg, = ax_gg.plot([], [], 'o', color='#00aaff', markersize=12, markeredgecolor='white', markeredgewidth=1)
-ax_gg.text(-4.5, 4, "G-FORCE", color='#888888', fontsize=12)
-
-# RPM (Right)
-ax_eng = fig.add_subplot(gs[1, 1])
-ax_eng.axis('off')
-txt_gear = ax_eng.text(0.5, 0.5, "N", color='#ffff00', fontsize=60, fontweight='bold', ha='center', va='center')
-txt_rpm = ax_eng.text(0.5, 0.2, "0 RPM", color='white', fontsize=18, ha='center', fontfamily='monospace')
-
-# 4. GRAPHS (Row 2 & 3)
-x_dist = np.linspace(0, track.total_length, TRACK_POINTS)
-
-# Speed (Row 2)
-ax_speed = fig.add_subplot(gs[2, :])
-ax_speed.set_facecolor('#1a1a1a')
-ax_speed.set_title("SPEED (km/h)", color='#888888', fontsize=12, loc='left')
-ax_speed.set_ylim(0, 360)
-ax_speed.set_xlim(0, track.total_length)
-ax_speed.grid(True, color='#333333', linestyle='--', linewidth=1)
-ax_speed.set_xticklabels([]) # Hide X labels for middle graph
-
-line_ghost_speed, = ax_speed.plot(x_dist, ghost_speed, color='#444444', linewidth=2, linestyle='--')
-line_speed, = ax_speed.plot(x_dist, lap_speed, color='#00aaff', linewidth=3)
-cursor_speed = ax_speed.axvline(x=0, color='white', linestyle=':', alpha=0.8, linewidth=2)
-
-# Pedals (Row 3)
-ax_pedals = fig.add_subplot(gs[3, :])
-ax_pedals.set_facecolor('#1a1a1a')
-ax_pedals.set_title("PEDALS", color='#888888', fontsize=12, loc='left')
-ax_pedals.set_ylim(-0.1, 1.1)
-ax_pedals.set_xlim(0, track.total_length)
-ax_pedals.grid(True, color='#333333', linestyle='--', linewidth=1)
-
-lap_throttle = np.full(TRACK_POINTS, np.nan)
-lap_brake = np.full(TRACK_POINTS, np.nan)
-
-line_thr, = ax_pedals.plot(x_dist, lap_throttle, color='#00ff00', linewidth=2, label='Throttle')
-line_brk, = ax_pedals.plot(x_dist, lap_brake, color='#ff0000', linewidth=2, label='Brake')
-ax_pedals.legend(loc='upper right', frameon=False, fontsize=10)
-cursor_pedals = ax_pedals.axvline(x=0, color='white', linestyle=':', alpha=0.8, linewidth=2)
-
-
-# -- Helper for mapping --
-tree = cKDTree(np.column_stack((track.x, track.y)))
-
-def efficient_update(frame):
-    global current_lap_num, last_idx
-    if not consumer: return dot,
-
-    msgs = consumer.poll(timeout_ms=0, max_records=50)
-    if not msgs: return dot,
-
-    last_state = None
-    
-    for tp, messages in msgs.items():
-        for msg in messages:
-            state = msg.value
-            last_state = state
-            
-            # 1. Detect New Lap
-            if state['lap_count'] > current_lap_num:
-                if current_lap_num != -1:
-                    np.copyto(ghost_speed, lap_speed)
-                    line_ghost_speed.set_ydata(ghost_speed)
-                lap_speed.fill(np.nan)
-                lap_throttle.fill(np.nan)
-                lap_brake.fill(np.nan)
-                current_lap_num = state['lap_count']
-                last_idx = -1
-
-            # 2. Find Index
-            dist, idx = tree.query([state['x'], state['y']])
-            
-            # 3. Update Buffers with GAP FILLING
-            if idx < TRACK_POINTS:
-                if last_idx != -1 and abs(idx - last_idx) < 500: 
-                    # forward fill
-                    if idx > last_idx:
-                        lap_speed[last_idx:idx+1] = state['speed_kmh']
-                        lap_throttle[last_idx:idx+1] = state['throttle']
-                        lap_brake[last_idx:idx+1] = state['brake']
-                    # backward fill
-                    elif idx < last_idx:
-                        lap_speed[idx:last_idx+1] = state['speed_kmh']
-                        lap_throttle[idx:last_idx+1] = state['throttle']
-                        lap_brake[idx:last_idx+1] = state['brake']
-                else:
-                    lap_speed[idx] = state['speed_kmh']
-                    lap_throttle[idx] = state['throttle']
-                    lap_brake[idx] = state['brake']
+        last_state = None
+        for tp, messages in msgs.items():
+            for msg in messages:
+                state = msg.value
+                last_state = state
                 
-                last_idx = idx
+                # New Lap Detection
+                if state['lap_count'] > self.current_lap_num:
+                    if self.current_lap_num != -1:
+                        # Copy current to ghost
+                        self.ghost_speed[:] = self.lap_speed[:]
+                        self.ghost_line.setData(self.x_dist, self.ghost_speed)
+                    
+                    self.lap_speed.fill(np.nan)
+                    self.lap_throttle.fill(np.nan)
+                    self.lap_brake.fill(np.nan)
+                    self.current_lap_num = state['lap_count']
+                    self.last_idx = -1
 
-    if last_state:
-        state = last_state
+                # Find Track Index
+                _, idx = self.tree.query([state['x'], state['y']])
+                
+                if idx < self.TRACK_POINTS:
+                    # Fill Gaps if needed
+                    if self.last_idx != -1 and abs(idx - self.last_idx) < 500:
+                        start, end = min(idx, self.last_idx), max(idx, self.last_idx)
+                        self.lap_speed[start:end+1] = state['speed_kmh']
+                        self.lap_throttle[start:end+1] = state['throttle']
+                        self.lap_brake[start:end+1] = state['brake']
+                    else:
+                        self.lap_speed[idx] = state['speed_kmh']
+                        self.lap_throttle[idx] = state['throttle']
+                        self.lap_brake[idx] = state['brake']
+                    self.last_idx = idx
+
+        if last_state:
+            self.render_state(last_state)
+
+    def render_state(self, state):
+        # Update Car Position
+        self.car_dot.setData([state['x']], [state['y']])
         
-        # UI Updates
-        dot.set_data([state['x']], [state['y']])
-        dot_gg.set_data([state['g_lat']], [state['g_long']])
+        # Update Metrics
+        self.timing_label.setText(
+            f"CURRENT LAP\n{state['lap_time']:.3f}\n\n"
+            f"LAST LAP\n{state['last_lap_time']:.3f}\n\n"
+            f"{state['sector_name']}"
+        )
         
-        txt_time_val.set_text(f"{state['last_lap_time']:.3f}")
-        txt_curr_val.set_text(f"{state['lap_time']:.3f}")
-        txt_sector.set_text(f"{state['sector_name']}")
-        txt_gear.set_text(str(state['gear']))
-        txt_rpm.set_text(f"{state['rpm']}")
-
-        # Graph Lines 
-        line_speed.set_ydata(lap_speed)
-        line_thr.set_ydata(lap_throttle)
-        line_brk.set_ydata(lap_brake)
+        self.engine_label.setText(f"GEAR: {state['gear']}\n{int(state['rpm'])} RPM")
         
-        # Cursors
-        current_dist = x_dist[tree.query([state['x'], state['y']])[1]]
-        cursor_speed.set_xdata([current_dist])
-        cursor_pedals.set_xdata([current_dist])
+        # Update G-Force
+        self.gg_dot.setData([state['g_lat']], [state['g_long']])
+        
+        # Update Trace Curves
+        self.speed_line.setData(self.x_dist, self.lap_speed, connect='finite')
+        self.throttle_line.setData(self.x_dist, self.lap_throttle, connect='finite')
+        self.brake_line.setData(self.x_dist, self.lap_brake, connect='finite')
+        
+        # Update Cursors
+        _, idx = self.tree.query([state['x'], state['y']])
+        current_dist = self.x_dist[idx]
+        self.speed_cursor.setValue(current_dist)
+        self.pedal_cursor.setValue(current_dist)
 
-    return dot, txt_curr_val
-
-ani = FuncAnimation(fig, efficient_update, interval=1000/VISUALIZATION_FPS, blit=False)
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = DashboardApp()
+    window.show()
+    sys.exit(app.exec())
