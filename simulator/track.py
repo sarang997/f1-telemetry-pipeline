@@ -1,75 +1,97 @@
 import numpy as np
+import json
+import os
 from scipy.interpolate import splprep, splev
 
-class SilverstoneTrack:
-    def __init__(self):
-        # Coordinates from visualizer.py
-        self.waypoints = np.array([
-            [0, 0], [10, 2], [15, 5], [12, 8], [8, 6], [5, 4], [20, 4],
-            [35, 6], [38, 4], [40, 0], [60, 0], [80, 5], [85, 3], [90, 6],
-            [120, 6], [130, 0], [110, -5], [100, -2], [0, 0]
-        ])
+class GeoJSONTrack:
+    def __init__(self, geojson_path):
+        if not os.path.exists(geojson_path):
+            raise FileNotFoundError(f"GeoJSON file not found: {geojson_path}")
+            
+        with open(geojson_path, 'r') as f:
+            data = json.load(f)
+            
+        # Extract LineString coordinates
+        # Assumes the first feature is the track
+        feature = data['features'][0]
+        coords = feature['geometry']['coordinates']
+        self.name = feature['properties'].get('Name', 'Unknown Track')
+        
+        # Convert List to Arrays [Lon, Lat]
+        # GeoJSON is usually [Lon, Lat]
+        trajectory_lonlat = np.array(coords) 
+        lon = trajectory_lonlat[:, 0]
+        lat = trajectory_lonlat[:, 1]
+        
+        # Project to Cartesian Meters (Simple Equirectangular approximation)
+        # Center point for projection
+        center_lon = np.mean(lon)
+        center_lat = np.mean(lat)
+        
+        # Meters per degree
+        # Lat: 111,132 meters
+        # Lon: 111,132 * cos(lat)
+        R_EARTH = 6378137.0
+        lat_rad = np.deg2rad(center_lat)
+        
+        x_meters = (lon - center_lon) * (np.pi/180) * R_EARTH * np.cos(lat_rad)
+        y_meters = (lat - center_lat) * (np.pi/180) * R_EARTH
+        
+        self.waypoints = np.column_stack((x_meters, y_meters))
         
         # High-res interpolation
+        # Using periodic spline (per=True) for closed loop
         tck, u = splprep(self.waypoints.T, s=0, per=True)
-        # Use more points for finer physics steps
+        
+        # 20,000 points for high-fidelity physics
         self.u_new = np.linspace(u.min(), u.max(), 20000) 
         x_norm, y_norm = splev(self.u_new, tck, der=0)
         
-        # Scale to real world length (5891m)
-        # Calculate current normalized length
-        dx_n = np.gradient(x_norm)
-        dy_n = np.gradient(y_norm)
-        dist_n = np.sum(np.sqrt(dx_n**2 + dy_n**2))
+        self.x = x_norm
+        self.y = y_norm
         
-        scale = 5891.0 / dist_n
-        self.x = x_norm * scale
-        self.y = y_norm * scale
-        
-        # Gradients for direction and curvature (on scaled coordinates)
+        # Calculate Gradients
         dx = np.gradient(self.x)
         dy = np.gradient(self.y)
         ddx = np.gradient(dx)
         ddy = np.gradient(dy)
         
-        # Radius of curvature: R = (x'b^2 + y'^2)^1.5 / |x'y'' - y'x''|
+        # Curvature
         self.curvature = np.abs(dx * ddy - dy * ddx) / np.power(dx**2 + dy**2, 1.5)
-        # Handle straight lines (infinite radius -> 0 curvature)
         self.curvature[np.isnan(self.curvature)] = 0.0
         
-        # Segment lengths
+        # Distances and Tangents
         self.dists = np.sqrt(dx**2 + dy**2)
         self.total_length = np.sum(self.dists)
         self.total_points = len(self.x)
         
-        # Tangent vectors (normalized)
         self.tangent_x = dx / self.dists
         self.tangent_y = dy / self.dists
         
-        # Map Names
-        self.map_names = self._generate_corner_names()
+        # Generate Map Names (Simple Division for now)
+        self.map_names = self._generate_sector_names()
         
-        print(f"Track Loaded. Length: {self.total_length:.2f}m Points: {len(self.x)}")
+        print(f"Loaded Track: {self.name}")
+        print(f"Length: {self.total_length:.2f}m | Points: {self.total_points}")
 
-    def _generate_corner_names(self):
-        # Map percentage of track distance to corner names
-        names = ["Hamilton Straight"] * self.total_points
+    def _generate_sector_names(self):
+        # Divide into 3 sectors
+        names = ["Sector 1"] * self.total_points
+        s2_start = int(self.total_points * 0.33)
+        s3_start = int(self.total_points * 0.66)
         
-        def set_zone(start_pct, end_pct, name):
-            start = int(start_pct * self.total_points)
-            end = int(end_pct * self.total_points)
-            for i in range(start, end):
-                names[i] = name
-
-        set_zone(0.05, 0.10, "Abbey")
-        set_zone(0.12, 0.18, "Village / The Loop")
-        set_zone(0.20, 0.30, "Wellington Straight")
-        set_zone(0.32, 0.38, "Brooklands / Luffield")
-        set_zone(0.40, 0.50, "National Pits Straight")
-        set_zone(0.52, 0.56, "Copse Corner")
-        set_zone(0.58, 0.65, "Maggotts / Becketts")
-        set_zone(0.66, 0.78, "Hangar Straight")
-        set_zone(0.80, 0.85, "Stowe")
-        set_zone(0.88, 0.92, "Vale / Club")
-        
+        for i in range(s2_start, s3_start):
+            names[i] = "Sector 2"
+        for i in range(s3_start, self.total_points):
+            names[i] = "Sector 3"
+            
         return names
+
+# For backward compatibility if needed, or we just replace SilverstoneTrack usage
+class SilverstoneTrack(GeoJSONTrack):
+    def __init__(self):
+        # Point detailed path to the specific geojson
+        # NOTE: Adjust path as necessary
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "tracks", "gb-1948.geojson")
+        super().__init__(path)

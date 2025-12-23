@@ -7,171 +7,175 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.schema import TelemetryData
 
-# Physics Constants (Ideally could be in config, but keeping physics-specific here)
-MASS = 798.0         # kg
-P_ENGINE = 740000.0  # Watts
-RHO = 1.225          # Air Density
-CD = 0.9             # Drag Coeff
-CL = 1.2             # Lift Coeff
-AREA = 1.6           # Frontal Area
-MU_MECH = 1.1        # Mech Grip
-G = 9.81             # Gravity
-BRAKE_FORCE_MAX = 4.0 * G * MASS 
+# --- PHYSICS CONSTANTS ---
+BASE_MASS = 798.0         # kg (Car + Driver - Fuel)
+FUEL_MASS_START = 110.0   # kg (Max Fuel)
+P_ENGINE = 740000.0       # Watts (~1000 HP)
+RHO = 1.225               # Air Density
+CD_BASE = 0.9             # Drag Coeff
+CD_DRS = 0.7              # Drag Coeff with DRS
+CL = 1.2                  # Lift Coeff
+AREA = 1.6                # Frontal Area
+MU_BASE = 1.1             # Base Mech Grip
+TIRE_WEAR_FACTOR = 1e-6   # Grip loss per meter
+G = 9.81
 
 class F1Sim:
     def __init__(self, track):
         self.track = track
         self.n = len(track.x)
         
-        # State
+        # Simulation State
         self.idx = 0
-        self.speed = 0.0 # m/s
+        self.speed = 0.0 # m/s (Current Speed)
         self.time = 0.0
         self.lap_count = 0
         self.lap_time = 0.0
         self.last_lap_time = 0.0
         
-        # Driver State (Smoothed Inputs)
+        # Vehicle State
+        self.fuel = FUEL_MASS_START
+        self.tire_life_dist = 0.0
+        self.drs_active = False
+        
+        # Driver Smoothed Inputs
         self.current_throttle = 0.0
         self.current_brake = 0.0
         
-        # Pre-calculate speed profile
-        self.target_speeds = self._calculate_target_speed_profile()
+        # Initialize Profile
+        self.target_speeds = self._calculate_ideal_velocity_profile()
+
+    @property
+    def total_mass(self):
+        return BASE_MASS + self.fuel
+        
+    @property
+    def mu_eff(self):
+        # Grip decays linearly with distance driven
+        return max(0.5, MU_BASE - (self.tire_life_dist * TIRE_WEAR_FACTOR))
 
     def _calculate_max_corner_speed(self, curvature):
         if curvature < 1e-5:
             return 360.0 / 3.6 
         
-        denom = curvature - (MU_MECH * RHO * CL * AREA) / (2 * MASS)
-        if denom <= 0:
-            return 360.0 / 3.6
-            
-        v_sq = (MU_MECH * G) / denom
+        # Assuming avg fuel for static profile
+        avg_mass = BASE_MASS + (FUEL_MASS_START / 2)
+        denom = curvature - (self.mu_eff * RHO * CL * AREA) / (2 * avg_mass)
+        
+        if denom <= 0: return 360.0 / 3.6
+        v_sq = (self.mu_eff * G) / denom
         return np.sqrt(v_sq)
 
-    def _calculate_target_speed_profile(self):
-        # Backward pass
+    def _calculate_ideal_velocity_profile(self):
+        # 1. Cornering Limits
         max_speeds = np.array([self._calculate_max_corner_speed(k) for k in self.track.curvature])
         
-        for _ in range(2):
+        # 2. Braking Zones (Backward Pass)
+        for _ in range(2): # Two passes for coverage
             for i in range(self.n - 2, -1, -1):
                 dist = self.track.dists[i]
                 v_next = max_speeds[i+1]
+                # Conservative Braking
                 a_brake = 4.0 * G 
                 v_allowable = np.sqrt(v_next**2 + 2 * a_brake * dist)
                 max_speeds[i] = min(max_speeds[i], v_allowable)
+            # Link last point to first
             max_speeds[-1] = min(max_speeds[-1], max_speeds[0])
 
         return max_speeds
 
     def step(self, dt):
-        """Advances the simulation by dt seconds. Returns current state dict."""
-        
-        current_x = self.track.x[self.idx]
-        current_y = self.track.y[self.idx]
+        self.x = self.track.x[self.idx]
+        self.y = self.track.y[self.idx]
         curvature = self.track.curvature[self.idx]
         target_v = self.target_speeds[self.idx]
         
-        # --- PHYSICS STEP ---
+        # --- LOGIC: DRS ZONES ---
+        # Very simple logic: DRS allowed if low curvature (straight) and lap > 0
+        is_straight = curvature < 0.0005
+        self.drs_active = (self.lap_count > 0) and is_straight and (self.speed * 3.6 > 100)
         
-        # 1. Aerodynamics
-        drag_force = 0.5 * RHO * self.speed**2 * CD * AREA
+        current_cd = CD_DRS if self.drs_active else CD_BASE
+
+        # --- PHYSICS: FORCES ---
+        
+        # 1. Aero
+        drag_force = 0.5 * RHO * self.speed**2 * current_cd * AREA
         downforce = 0.5 * RHO * self.speed**2 * CL * AREA
         
-        # 2. Driver Input Logic (PID-ish)
-        # Determine Target
+        # 2. Driver Input Sim
         target_throttle = 0.0
         target_brake = 0.0
         
-        if self.speed < target_v:
+        if self.speed < (target_v * 0.98): # Accelerate
             target_throttle = 1.0
-        else:
+        elif self.speed > (target_v * 1.02): # Brake
             target_brake = 1.0
-
-        # Apply Smoothing (Simulate Foot Speed)
-        # Rate: 5.0 units/sec = 0.2s for full press
+        
+        # Smooth Inputs
         INPUT_RATE = 5.0 * dt
+        self.current_throttle += np.clip(target_throttle - self.current_throttle, -INPUT_RATE, INPUT_RATE)
+        self.current_brake += np.clip(target_brake - self.current_brake, -INPUT_RATE, INPUT_RATE)
         
-        # Throttle
-        if self.current_throttle < target_throttle:
-            self.current_throttle = min(target_throttle, self.current_throttle + INPUT_RATE)
-        else:
-            self.current_throttle = max(target_throttle, self.current_throttle - INPUT_RATE)
-
-        # Brake
-        if self.current_brake < target_brake:
-            self.current_brake = min(target_brake, self.current_brake + INPUT_RATE)
-        else:
-            self.current_brake = max(target_brake, self.current_brake - INPUT_RATE)
-
-        # 3. Calculate Forces
+        # 3. Longitudinal Forces
+        # Engine Power limited by grip at low speed
         engine_force = 0.0
-        brake_force = 0.0
-        
         if self.speed > 1.0:
-            engine_force = (min(P_ENGINE / self.speed, MASS * G * 1.5)) * self.current_throttle
+            power_available = min(P_ENGINE / self.speed, self.total_mass * G * 1.5)
+            engine_force = power_available * self.current_throttle
         else:
-            engine_force = (MASS * G * 1.0) * self.current_throttle
+            engine_force = (self.total_mass * G * 0.8) * self.current_throttle
             
-        max_grip_force = (MASS * G + downforce) * MU_MECH
-        brake_force = min(BRAKE_FORCE_MAX, max_grip_force) * self.current_brake
+        max_grip_force = (self.total_mass * G + downforce) * self.mu_eff
+        brake_force = min(4.0 * G * self.total_mass, max_grip_force) * self.current_brake
         
-        # 3. Net Force
-        f_long = engine_force - brake_force - drag_force
-        accel_long = f_long / MASS
+        net_force = engine_force - brake_force - drag_force
+        accel_long = net_force / self.total_mass
         
-        # 4. Integrate Speed
+        # --- STATE UPDATE ---
+        
+        # Speed Integration
         self.speed += accel_long * dt
         if self.speed < 0: self.speed = 0
         
-        # 5. Integrate Position
+        # Position Integration
         dist_step = self.speed * dt
+        self.tire_life_dist += dist_step
         
+        # Fuel Burn (Approx 0.002 kg/sec at full throttle)
+        self.fuel = max(0.0, self.fuel - (0.002 * self.current_throttle * dt * (self.speed/100 + 1)))
+
         dist_accum = 0.0
         while dist_accum < dist_step:
             dist_accum += self.track.dists[self.idx]
             self.idx += 1
             if self.idx >= self.n:
-                self.last_lap_time = self.lap_time # Capture time before reset
+                self.last_lap_time = self.lap_time
                 self.idx = 0
                 self.lap_count += 1
                 self.lap_time = 0.0
-        
+                print(f"[SIM] Lap {self.lap_count} | Fuel: {self.fuel:.1f}kg | Grip: {self.mu_eff:.3f}")
+
         self.lap_time += dt
         self.time += dt
         
-        # 6. G-Forces
+        # Calculated Outputs
         accel_lat = (self.speed**2) * curvature
-        g_lat = accel_lat / G
-        g_long = accel_long / G
+        self.g_lat = accel_lat / G
+        self.g_long = accel_long / G
         
-        # 7. Gear & RPM
+        # Gear / RPM Logic
         speed_kmh = self.speed * 3.6
-        gear = 1
-        if speed_kmh > 310: gear = 8
-        elif speed_kmh > 270: gear = 7
-        elif speed_kmh > 240: gear = 6
-        elif speed_kmh > 200: gear = 5
-        elif speed_kmh > 160: gear = 4
-        elif speed_kmh > 120: gear = 3
-        elif speed_kmh > 80: gear = 2
+        self.gear = 1
+        gears = [0, 80, 120, 160, 200, 240, 270, 310, 1000]
+        for i in range(1, 9):
+            if speed_kmh < gears[i]:
+                self.gear = i
+                break
         
-        rpm = 10500 + (self.speed % 10) * 150
+        # Base RPM (Sensor adds noise later)
+        self.rpm = 10000 + (self.speed % 15) * 200
+        self.sector_name = self.track.map_names[self.idx]
+        self.timestamp = int(time.time_ns())
         
-        return TelemetryData(
-            time=self.time,
-            x=current_x,
-            y=current_y,
-            speed_kmh=speed_kmh,
-            throttle=self.current_throttle,
-            brake=self.current_brake,
-            gear=gear,
-            g_lat=g_lat,
-            g_long=g_long,
-            rpm=int(rpm),
-            lap_count=self.lap_count,
-            lap_time=self.lap_time,
-            last_lap_time=getattr(self, 'last_lap_time', 0.0),
-            sector_name=self.track.map_names[self.idx],
-            timestamp=int(time.time_ns())
-        )
+        return self

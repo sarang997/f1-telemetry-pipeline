@@ -13,6 +13,87 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_API_VERSION, VISUALIZATION_FPS, VIZ_GROUP_ID
 from simulator.track import SilverstoneTrack
 
+# -----------------------------------------------------------------------------
+# 1. SPECIALIZED WIDGETS
+# -----------------------------------------------------------------------------
+
+class LapHistoryWidget(QtWidgets.QTableWidget):
+    """
+    Displays the last N laps with sector times (if available) and total time.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(3)
+        self.setHorizontalHeaderLabels(["LAP", "TIME", "STATUS"])
+        self.verticalHeader().setVisible(False)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.setStyleSheet("""
+            QTableWidget {
+                background-color: #1a1a1a;
+                color: #ffffff;
+                border: 1px solid #333333;
+                font-family: 'Courier New';
+                font-size: 14px;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: #aaaaaa;
+                padding: 4px;
+                border: none;
+            }
+        """)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.history = []
+
+    def add_lap(self, lap_num, lap_time, is_pb=False):
+        row = self.rowCount()
+        self.insertRow(row)
+        
+        # Lap Num
+        item_num = QtWidgets.QTableWidgetItem(str(lap_num))
+        item_num.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.setItem(row, 0, item_num)
+        
+        # Time
+        item_time = QtWidgets.QTableWidgetItem(f"{lap_time:.3f}")
+        item_time.setTextAlignment(QtCore.Qt.AlignCenter)
+        if is_pb:
+            item_time.setForeground(QtGui.QColor('#00ff00')) # Green for PB
+        self.setItem(row, 1, item_time)
+        
+        # Status (Placeholder for now)
+        status = "PB" if is_pb else "OK"
+        item_status = QtWidgets.QTableWidgetItem(status)
+        item_status.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.setItem(row, 2, item_status)
+        
+        self.scrollToBottom()
+
+class AnalyticsWidget(QtWidgets.QWidget):
+    """
+    Placeholder for future PySpark integration.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        self.label = QtWidgets.QLabel("ANALYTICS ENGINE\n[OFFLINE]")
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        self.label.setStyleSheet("font-family: 'Impact'; font-size: 24px; color: #555555;")
+        layout.addWidget(self.label)
+        
+        self.sub_label = QtWidgets.QLabel("Waiting for PySpark Stream...")
+        self.sub_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.sub_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #444444;")
+        layout.addWidget(self.sub_label)
+        
+        self.setStyleSheet("background-color: #0f0f0f; border: 1px dashed #333333;")
+
+# -----------------------------------------------------------------------------
+# 2. MAIN DASHBOARD APPLICATION
+# -----------------------------------------------------------------------------
+
 class DashboardApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -31,6 +112,7 @@ class DashboardApp(QtWidgets.QMainWindow):
         
         self.current_lap_num = -1
         self.last_idx = -1
+        self.fastest_lap_time = float('inf')
         
         # Kafka Setup
         try:
@@ -55,106 +137,180 @@ class DashboardApp(QtWidgets.QMainWindow):
         self.timer.start(int(1000 / VISUALIZATION_FPS))
 
     def init_ui(self):
-        self.setWindowTitle("F1 Telemetry Dashboard (PyQtGraph)")
-        self.resize(1200, 900)
+        self.setWindowTitle("F1 Telemetry Hybrid Dashboard")
+        self.resize(1600, 1000)
         self.setStyleSheet("background-color: #0d0d0d; color: #ffffff;")
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Top Row: Track and Metrics
-        top_layout = QtWidgets.QHBoxLayout()
-        main_layout.addLayout(top_layout, stretch=3)
+        # Tab Widget
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+            }
+            QTabBar::tab {
+                background-color: #1a1a1a;
+                color: #aaaaaa;
+                padding: 10px 20px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QTabBar::tab:selected {
+                background-color: #333333;
+                color: #ffffff;
+            }
+        """)
+        main_layout.addWidget(self.tabs)
         
-        # 1. Track Map
-        self.track_widget = pg.PlotWidget(title="TRACK MAP")
+        # ---------------------------------------------------------
+        # TAB 1: TELEMETRY (Main Dashboard)
+        # ---------------------------------------------------------
+        telemetry_tab = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(telemetry_tab)
+        grid.setContentsMargins(10, 10, 10, 10)
+        grid.setSpacing(10)
+        
+        # ---------------------------------------------------------
+        # TOP LEFT: Track Map & Live Metrics (BIGGER NOW)
+        # ---------------------------------------------------------
+        tl_widget = QtWidgets.QWidget()
+        tl_layout = QtWidgets.QVBoxLayout(tl_widget)
+        tl_layout.setContentsMargins(0,0,0,0)
+        
+        # Track Map (PyQtGraph) - MUCH BIGGER
+        self.track_widget = pg.PlotWidget(title="TRACK MAP & POSITION")
         self.track_widget.setAspectLocked(True)
         self.track_widget.showAxis('left', False)
         self.track_widget.showAxis('bottom', False)
         self.track_widget.setBackground('#0d0d0d')
         
-        # Plot Track
-        self.track_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#333333', width=10))
+        self.track_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#333333', width=14))
         self.track_widget.addItem(self.track_line)
-        self.track_center_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#00aaff', width=1, style=QtCore.Qt.DashLine))
+        self.track_center_line = pg.PlotCurveItem(self.track.x, self.track.y, pen=pg.mkPen('#00aaff', width=2, style=QtCore.Qt.DashLine))
         self.track_widget.addItem(self.track_center_line)
         
-        # Car Dot
-        self.car_dot = pg.ScatterPlotItem(size=15, brush=pg.mkBrush('#ff0000'), pen=pg.mkPen('w', width=1))
+        self.car_dot = pg.ScatterPlotItem(size=20, brush=pg.mkBrush('#ff0000'), pen=pg.mkPen('w', width=2))
         self.track_widget.addItem(self.car_dot)
         
-        top_layout.addWidget(self.track_widget, stretch=2)
+        tl_layout.addWidget(self.track_widget, stretch=5)  # Increased from 3 to 5
         
-        # 2. Metrics (Timing & G-Force)
-        metrics_layout = QtWidgets.QVBoxLayout()
-        top_layout.addLayout(metrics_layout, stretch=1)
+        # Live Stats Row (Speed, Gear, RPM) in Top Left
+        stats_layout = QtWidgets.QHBoxLayout()
         
-        # Timing Panel
-        self.timing_label = QtWidgets.QLabel("CURRENT LAP\n--:--.---\n\nLAST LAP\n--:--.---")
-        self.timing_label.setStyleSheet("font-family: 'Courier New'; font-size: 24px; font-weight: bold; color: #00ff00;")
+        self.lbl_speed = QtWidgets.QLabel("0\nKM/H")
+        self.lbl_speed.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_speed.setStyleSheet("font-family: 'Impact'; font-size: 36px; color: #00aaff;")
+        
+        self.lbl_gear = QtWidgets.QLabel("N\nGEAR")
+        self.lbl_gear.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_gear.setStyleSheet("font-family: 'Impact'; font-size: 36px; color: #feab3a;")
+        
+        self.lbl_rpm = QtWidgets.QLabel("0\nRPM")
+        self.lbl_rpm.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_rpm.setStyleSheet("font-family: 'Impact'; font-size: 36px; color: #ff0055;")
+        
+        stats_layout.addWidget(self.lbl_speed)
+        stats_layout.addWidget(self.lbl_gear)
+        stats_layout.addWidget(self.lbl_rpm)
+        
+        tl_layout.addLayout(stats_layout, stretch=1)
+        grid.addWidget(tl_widget, 0, 0)
+        
+        # ---------------------------------------------------------
+        # TOP RIGHT: Lap History & Timing
+        # ---------------------------------------------------------
+        tr_widget = QtWidgets.QWidget()
+        tr_layout = QtWidgets.QVBoxLayout(tr_widget)
+        
+        # Big Timing Display
+        self.timing_label = QtWidgets.QLabel("0:00.000")
         self.timing_label.setAlignment(QtCore.Qt.AlignCenter)
-        metrics_layout.addWidget(self.timing_label)
+        self.timing_label.setStyleSheet("font-family: 'Courier New'; font-size: 64px; font-weight: bold; color: #ffffff;")
+        tr_layout.addWidget(self.timing_label)
         
-        # G-Force Plot
-        self.gg_widget = pg.PlotWidget(title="G-FORCE")
-        self.gg_widget.setXRange(-5, 5)
-        self.gg_widget.setYRange(-5, 5)
-        self.gg_widget.setAspectLocked(True)
-        self.gg_widget.setBackground('#1a1a1a')
-        self.gg_widget.addLine(x=0, pen='#333333')
-        self.gg_widget.addLine(y=0, pen='#333333')
+        # Car Status Panel (moved here from bottom right)
+        status_group = QtWidgets.QGroupBox("CAR STATUS")
+        status_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #333; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px; }")
+        status_layout = QtWidgets.QGridLayout(status_group)
         
-        # Circle at 4G
-        theta = np.linspace(0, 2*np.pi, 100)
-        cx = 4 * np.cos(theta)
-        cy = 4 * np.sin(theta)
-        self.gg_circle = pg.PlotCurveItem(cx, cy, pen=pg.mkPen('#555555', width=1))
-        self.gg_widget.addItem(self.gg_circle)
+        # Fuel
+        self.lbl_fuel = QtWidgets.QLabel("FUEL\n-- KG")
+        self.lbl_fuel.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_fuel.setStyleSheet("background-color: #222; border-radius: 5px; padding: 10px; font-weight: bold; font-size: 16px;")
+        status_layout.addWidget(self.lbl_fuel, 0, 0)
         
-        self.gg_dot = pg.ScatterPlotItem(size=12, brush=pg.mkBrush('#00aaff'), pen=pg.mkPen('w', width=1))
-        self.gg_widget.addItem(self.gg_dot)
-        metrics_layout.addWidget(self.gg_widget)
+        # Tires (Grip/Wear)
+        self.lbl_tires = QtWidgets.QLabel("GRIP\n-- %")
+        self.lbl_tires.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_tires.setStyleSheet("background-color: #222; border-radius: 5px; padding: 10px; font-weight: bold; font-size: 16px;")
+        status_layout.addWidget(self.lbl_tires, 0, 1)
         
-        # Gear / RPM
-        self.engine_label = QtWidgets.QLabel("GEAR: N\n0 RPM")
-        self.engine_label.setStyleSheet("font-family: 'Impact'; font-size: 40px; color: #ffff00;")
-        self.engine_label.setAlignment(QtCore.Qt.AlignCenter)
-        metrics_layout.addWidget(self.engine_label)
+        tr_layout.addWidget(status_group)
         
-        # Middle: Speed Trace
-        self.speed_widget = pg.PlotWidget(title="SPEED (km/h)")
-        self.speed_widget.setYRange(0, 360)
-        self.speed_widget.setXRange(0, self.track.total_length)
-        self.speed_widget.setBackground('#1a1a1a')
-        self.speed_widget.showGrid(x=True, y=True, alpha=0.3)
+        # Lap History Table (Reuse our custom class)
+        self.lap_table = LapHistoryWidget()
+        tr_layout.addWidget(self.lap_table)
+        
+        grid.addWidget(tr_widget, 0, 1)
+
+        # ---------------------------------------------------------
+        # BOTTOM: Telemetry Traces (Speed/Pedals) - FULL WIDTH
+        # ---------------------------------------------------------
+        bl_widget = QtWidgets.QWidget()
+        bl_layout = QtWidgets.QVBoxLayout(bl_widget)
+        bl_layout.setContentsMargins(0,0,0,0)
+        
+        # Speed Trace
+        self.speed_plot = pg.PlotWidget(title="SPEED LIVE vs GHOST")
+        self.speed_plot.setBackground('#1a1a1a')
+        self.speed_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.speed_plot.setXRange(0, self.track.total_length)
+        self.speed_plot.setYRange(0, 350)
         
         self.ghost_line = pg.PlotCurveItem(pen=pg.mkPen('#444444', width=2, style=QtCore.Qt.DashLine))
         self.speed_line = pg.PlotCurveItem(pen=pg.mkPen('#00aaff', width=3))
-        self.speed_widget.addItem(self.ghost_line)
-        self.speed_widget.addItem(self.speed_line)
-        
+        self.speed_plot.addItem(self.ghost_line)
+        self.speed_plot.addItem(self.speed_line)
         self.speed_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', width=1, style=QtCore.Qt.DotLine))
-        self.speed_widget.addItem(self.speed_cursor)
+        self.speed_plot.addItem(self.speed_cursor)
         
-        main_layout.addWidget(self.speed_widget, stretch=1.5)
+        bl_layout.addWidget(self.speed_plot, stretch=1)
         
-        # Bottom: Pedal Traces
-        self.pedal_widget = pg.PlotWidget(title="PEDALS")
-        self.pedal_widget.setYRange(-0.1, 1.1)
-        self.pedal_widget.setXRange(0, self.track.total_length)
-        self.pedal_widget.setBackground('#1a1a1a')
-        self.pedal_widget.showGrid(x=True, y=True, alpha=0.3)
+        # Pedal Trace
+        self.pedal_plot = pg.PlotWidget(title="THROTTLE / BRAKE")
+        self.pedal_plot.setBackground('#1a1a1a')
+        self.pedal_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.pedal_plot.setXRange(0, self.track.total_length)
+        self.pedal_plot.setYRange(-0.1, 1.1)
         
         self.throttle_line = pg.PlotCurveItem(pen=pg.mkPen('#00ff00', width=2))
         self.brake_line = pg.PlotCurveItem(pen=pg.mkPen('#ff0000', width=2))
-        self.pedal_widget.addItem(self.throttle_line)
-        self.pedal_widget.addItem(self.brake_line)
-        
+        self.pedal_plot.addItem(self.throttle_line)
+        self.pedal_plot.addItem(self.brake_line)
         self.pedal_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('w', width=1, style=QtCore.Qt.DotLine))
-        self.pedal_widget.addItem(self.pedal_cursor)
+        self.pedal_plot.addItem(self.pedal_cursor)
         
-        main_layout.addWidget(self.pedal_widget, stretch=1.5)
+        bl_layout.addWidget(self.pedal_plot, stretch=1)
+        
+        grid.addWidget(bl_widget, 1, 0, 1, 2)  # Span both columns
+        
+        self.tabs.addTab(telemetry_tab, "TELEMETRY")
+        
+        # ---------------------------------------------------------
+        # TAB 2: ANALYTICS (Separate Tab)
+        # ---------------------------------------------------------
+        analytics_tab = QtWidgets.QWidget()
+        analytics_layout = QtWidgets.QVBoxLayout(analytics_tab)
+        analytics_layout.setContentsMargins(20, 20, 20, 20)
+        
+        self.analytics_widget = AnalyticsWidget()
+        analytics_layout.addWidget(self.analytics_widget)
+        
+        self.tabs.addTab(analytics_tab, "ANALYTICS")
 
     def update(self):
         if not self.consumer:
@@ -170,33 +326,46 @@ class DashboardApp(QtWidgets.QMainWindow):
                 state = msg.value
                 last_state = state
                 
-                # New Lap Detection
-                if state['lap_count'] > self.current_lap_num:
+                # New Lap Logic - Use .get() for safety
+                lap = state.get('lap_count', 0)
+                if lap > self.current_lap_num:
                     if self.current_lap_num != -1:
                         # Copy current to ghost
                         self.ghost_speed[:] = self.lap_speed[:]
                         self.ghost_line.setData(self.x_dist, self.ghost_speed)
+                        
+                        # Add to history
+                        last_time = state.get('last_lap_time', 0)
+                        if last_time > 0:
+                            is_pb = last_time < self.fastest_lap_time
+                            if is_pb:
+                                self.fastest_lap_time = last_time
+                            self.lap_table.add_lap(self.current_lap_num, last_time, is_pb)
                     
                     self.lap_speed.fill(np.nan)
                     self.lap_throttle.fill(np.nan)
                     self.lap_brake.fill(np.nan)
-                    self.current_lap_num = state['lap_count']
+                    self.current_lap_num = lap
                     self.last_idx = -1
 
                 # Find Track Index
-                _, idx = self.tree.query([state['x'], state['y']])
+                _, idx = self.tree.query([state.get('x',0), state.get('y',0)])
                 
                 if idx < self.TRACK_POINTS:
                     # Fill Gaps if needed
+                    s_kmh = state.get('speed_kmh', 0)
+                    s_thr = state.get('throttle', 0)
+                    s_brk = state.get('brake', 0)
+                    
                     if self.last_idx != -1 and abs(idx - self.last_idx) < 500:
                         start, end = min(idx, self.last_idx), max(idx, self.last_idx)
-                        self.lap_speed[start:end+1] = state['speed_kmh']
-                        self.lap_throttle[start:end+1] = state['throttle']
-                        self.lap_brake[start:end+1] = state['brake']
+                        self.lap_speed[start:end+1] = s_kmh
+                        self.lap_throttle[start:end+1] = s_thr
+                        self.lap_brake[start:end+1] = s_brk
                     else:
-                        self.lap_speed[idx] = state['speed_kmh']
-                        self.lap_throttle[idx] = state['throttle']
-                        self.lap_brake[idx] = state['brake']
+                        self.lap_speed[idx] = s_kmh
+                        self.lap_throttle[idx] = s_thr
+                        self.lap_brake[idx] = s_brk
                     self.last_idx = idx
 
         if last_state:
@@ -204,19 +373,31 @@ class DashboardApp(QtWidgets.QMainWindow):
 
     def render_state(self, state):
         # Update Car Position
-        self.car_dot.setData([state['x']], [state['y']])
+        self.car_dot.setData([state.get('x',0)], [state.get('y',0)])
         
-        # Update Metrics
-        self.timing_label.setText(
-            f"CURRENT LAP\n{state['lap_time']:.3f}\n\n"
-            f"LAST LAP\n{state['last_lap_time']:.3f}\n\n"
-            f"{state['sector_name']}"
-        )
+        # Update Stats
+        self.lbl_speed.setText(f"{int(state.get('speed_kmh',0))}\nKM/H")
+        self.lbl_gear.setText(f"{state.get('gear','N')}\nGEAR")
+        self.lbl_rpm.setText(f"{int(state.get('rpm',0))}\nRPM")
         
-        self.engine_label.setText(f"GEAR: {state['gear']}\n{int(state['rpm'])} RPM")
+        # Update Timing Label
+        self.timing_label.setText(f"{state.get('lap_time',0):.3f}")
         
-        # Update G-Force
-        self.gg_dot.setData([state['g_lat']], [state['g_long']])
+        # Update Status
+        fuel = state.get('fuel_kg', 0)
+        self.lbl_fuel.setText(f"FUEL\n{fuel:.1f} KG")
+        
+        # Use simple color coding for fuel
+        if fuel < 10:
+            self.lbl_fuel.setStyleSheet("background-color: #550000; border-radius: 5px; padding: 10px; font-weight: bold; color: #ff5555;")
+        else:
+            self.lbl_fuel.setStyleSheet("background-color: #222; border-radius: 5px; padding: 10px; font-weight: bold;")
+
+        # Grip / Tire Wear
+        # Note: tire_wear_pct might be available if we add it, but 'mu_eff' is grip coeff (approx 1.1 max)
+        # Check if we have tire_wear_pct in state (added in sensors.py?? No, I just checked and it WAS there in EngineMonitor)
+        wear = state.get('tire_wear_pct', 0) 
+        self.lbl_tires.setText(f"WEAR\n{wear:.1f}%")
         
         # Update Trace Curves
         self.speed_line.setData(self.x_dist, self.lap_speed, connect='finite')
@@ -224,7 +405,7 @@ class DashboardApp(QtWidgets.QMainWindow):
         self.brake_line.setData(self.x_dist, self.lap_brake, connect='finite')
         
         # Update Cursors
-        _, idx = self.tree.query([state['x'], state['y']])
+        _, idx = self.tree.query([state.get('x',0), state.get('y',0)])
         current_dist = self.x_dist[idx]
         self.speed_cursor.setValue(current_dist)
         self.pedal_cursor.setValue(current_dist)

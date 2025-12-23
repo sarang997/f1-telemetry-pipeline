@@ -65,35 +65,47 @@ def run_ingest_worker():
     
     try:
         for message in consumer:
-            data = message.value
-            
-            # Create Point
-            p = Point("telemetry") \
-                .tag("car_id", "HAM_44") \
-                .tag("circuit", "silverstone") \
-                .field("speed_kmh", float(data['speed_kmh'])) \
-                .field("rpm", int(data['rpm'])) \
-                .field("gear", int(data['gear'])) \
-                .field("throttle", float(data['throttle'])) \
-                .field("brake", float(data['brake'])) \
-                .field("g_lat", float(data['g_lat'])) \
-                .field("g_long", float(data['g_long'])) \
-                .time(int(data['timestamp']))
-            
-            batch.append(p)
-            
-            # Write Batch
-            if len(batch) >= BATCH_SIZE:
-                try:
-                    write_api.write(bucket=INFLUX_BUCKET, record=batch)
-                    count += len(batch)
-                    print(f"Ingested {count} records. Latest Speed={data['speed_kmh']:.1f}")
-                    batch = [] # Reset batch
-                except Exception as e:
-                    print(f"Failed to write batch to InfluxDB: {e}")
-                    # In a production app, you might pause and retry here.
-                    # For now, we raise to stop the worker so we don't lose data silently.
-                    raise e
+            try:
+                data = message.value
+                
+                # Check for critical timestamp, otherwise skip
+                if 'timestamp' not in data:
+                    continue
+
+                # Create Point with safe getters
+                p = Point("telemetry") \
+                    .tag("car_id", "HAM_44") \
+                    .tag("circuit", "silverstone") \
+                    .field("speed_kmh", float(data.get('speed_kmh', 0.0))) \
+                    .field("rpm", int(data.get('rpm', 0))) \
+                    .field("gear", int(data.get('gear', 0))) \
+                    .field("throttle", float(data.get('throttle', 0.0))) \
+                    .field("brake", float(data.get('brake', 0.0))) \
+                    .field("g_lat", float(data.get('g_lat', 0.0))) \
+                    .field("g_long", float(data.get('g_long', 0.0))) \
+                    .time(int(data['timestamp']))
+                
+                batch.append(p)
+                
+                # Write Batch
+                if len(batch) >= BATCH_SIZE:
+                    try:
+                        write_api.write(bucket=INFLUX_BUCKET, record=batch)
+                        count += len(batch)
+                        
+                        # Safe logging
+                        speed = data.get('speed_kmh', 0.0)
+                        print(f"Ingested {count} records. Latest Speed={speed:.1f}")
+                        batch = [] # Reset batch
+                    except Exception as e:
+                        print(f"Failed to write batch to InfluxDB: {e}")
+                        # In production, we might log this to an error topic or retry with backoff.
+                        # For now, we clear the batch to prevent a loop if the data is bad.
+                        batch = []
+                        
+            except Exception as msg_e:
+                print(f"Skipping bad message: {msg_e}")
+                continue
             
     except KeyboardInterrupt:
         print("\nStopping Ingest Worker...")

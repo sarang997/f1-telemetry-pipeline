@@ -9,17 +9,22 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kafka import KafkaProducer
 from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_API_VERSION, PHYSICS_FREQUENCY
 from simulator.track import SilverstoneTrack
-from simulator.physics import F1Sim
+from simulator.car import SmartCar
 
 def json_serializer(data):
-    if hasattr(data, 'to_json'):
-        return data.to_json().encode("utf-8")
+    # Data is now a dict, so json.dumps works directly
     return json.dumps(data).encode("utf-8")
 
 def run_transmitter():
-    # Initialize Physics
-    track = SilverstoneTrack()
-    sim = F1Sim(track)
+    # Initialize Physics & Sensors
+    try:
+        track = SilverstoneTrack()
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
+
+    # Use the new SmartCar container
+    car = SmartCar(track)
     
     # Initialize Kafka
     try:
@@ -37,17 +42,18 @@ def run_transmitter():
     # Simulation Loop
     target_dt = 1.0 / PHYSICS_FREQUENCY
     
-    print(f"Starting F1 Telemetry Stream ({PHYSICS_FREQUENCY}Hz)...")
+    print(f"Starting F1 Telemetry Stream ({PHYSICS_FREQUENCY}Hz) on {track.name}...")
+    print("Sensors Active: " + ", ".join([s.name for s in car.sensors.sensors]))
     
     try:
         while True:
             start_time = time.time()
             
-            # Step Physics (Returns TelemetryData object)
-            state = sim.step(target_dt)
+            # Update Car (Physics + Sensors)
+            telemetry_payload = car.update(target_dt)
             
             # Send to Kafka
-            producer.send(KAFKA_TOPIC, state)
+            producer.send(KAFKA_TOPIC, telemetry_payload)
             
             # Sleep to maintain frequency
             elapsed = time.time() - start_time
@@ -56,17 +62,9 @@ def run_transmitter():
             if sleep_time > 0:
                 time.sleep(sleep_time)
                 
-            # Log every 1 second
-            if int(state.time * PHYSICS_FREQUENCY) % PHYSICS_FREQUENCY == 0:
-                print(f"Sent: T={state.time:.2f} Speed={state.speed_kmh:.1f} km/h")
-                
     except KeyboardInterrupt:
         print("\nStopping Stream.")
         producer.close()
 
 if __name__ == "__main__":
     run_transmitter()
-
-
-#TODO
-#Add mechanism to add the sensors to the data (then send the data to the same message )
