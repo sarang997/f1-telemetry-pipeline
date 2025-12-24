@@ -90,8 +90,7 @@ class AnalyticsWidget(QtWidgets.QWidget):
         layout.addWidget(header)
         
         # Status Label
-        self.status_label = QtWidgets.QLabel("
-        analytics stream...")
+        self.status_label = QtWidgets.QLabel("Connecting to analytics stream...")
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
         self.status_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #888888;")
         layout.addWidget(self.status_label)
