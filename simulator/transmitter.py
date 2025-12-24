@@ -22,8 +22,7 @@ def run_transmitter():
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
-
-    # Use the new SmartCar container
+    
     car = SmartCar(track)
     
     # Initialize Kafka
@@ -31,34 +30,36 @@ def run_transmitter():
         producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=json_serializer,
-            acks=0, # Fire and forget
+            acks=0,
             api_version=KAFKA_API_VERSION
         )
         print(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
     except Exception as e:
         print(f"Failed to connect to Kafka: {e}")
         return
-
-    # Simulation Loop
-    target_dt = 1.0 / PHYSICS_FREQUENCY
     
+    target_dt = 1.0 / PHYSICS_FREQUENCY
     print(f"Starting F1 Telemetry Stream ({PHYSICS_FREQUENCY}Hz) on {track.name}...")
     print("Sensors Active: " + ", ".join([s.name for s in car.sensors.sensors]))
     
+    last_time = time.time()
+    
     try:
         while True:
-            start_time = time.time()
+            loop_start = time.time()
             
-            # Update Car (Physics + Sensors)
-            telemetry_payload = car.update(target_dt)
+            current_time = time.time()
+            actual_dt = current_time - last_time
+            last_time = current_time
             
-            # Send to Kafka
+            actual_dt = min(actual_dt, 0.1)
+            
+            telemetry_payload = car.update(actual_dt)
+            
             producer.send(KAFKA_TOPIC, telemetry_payload)
             
-            # Sleep to maintain frequency
-            elapsed = time.time() - start_time
+            elapsed = time.time() - loop_start
             sleep_time = max(0, target_dt - elapsed)
-            
             if sleep_time > 0:
                 time.sleep(sleep_time)
                 

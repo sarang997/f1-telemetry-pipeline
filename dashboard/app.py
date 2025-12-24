@@ -90,16 +90,18 @@ class AnalyticsWidget(QtWidgets.QWidget):
         layout.addWidget(header)
         
         # Status Label
-        self.status_label = QtWidgets.QLabel("Connecting to analytics stream...")
+        self.status_label = QtWidgets.QLabel("
+        analytics stream...")
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
         self.status_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #888888;")
         layout.addWidget(self.status_label)
         
         # Lap Comparison Table
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "LAP", "AVG SPEED", "MAX SPEED", "FUEL USED", "THROTTLE %", "LAP TIME", "SAMPLES"
+            "LAP", "AVG SPEED", "MAX SPEED", "FUEL USED", "THROTTLE %", "LAP TIME", "SAMPLES",
+            "FUEL/LAP", "TIRE DEG", "AGGRO"
         ])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -266,18 +268,6 @@ class AnalyticsWidget(QtWidgets.QWidget):
                 self.lbl_avg_lap.setText(f"AVG LAP\n{avg_time:.3f}s")
     
 
-    
-    def _is_best_lap(self, lap_num):
-        """Check if this is the best lap."""
-        lap_times = [(lap, data.get('last_lap_time_s', float('inf'))) 
-                    for lap, data in self.analytics_data.items() 
-                    if data.get('last_lap_time_s', 0) > 0]
-        
-        if not lap_times:
-            return False
-        
-        best_lap_num, _ = min(lap_times, key=lambda x: x[1])
-        return lap_num == best_lap_num
     
     def _create_item(self, text, center=False):
         """Helper to create table items."""
