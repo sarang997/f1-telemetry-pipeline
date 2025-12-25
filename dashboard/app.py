@@ -10,7 +10,7 @@ from scipy.spatial import cKDTree
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_API_VERSION, VISUALIZATION_FPS, VIZ_GROUP_ID
+from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, ANALYTICS_TOPIC, KAFKA_API_VERSION, VISUALIZATION_FPS, VIZ_GROUP_ID
 from simulator.track import SilverstoneTrack
 
 # -----------------------------------------------------------------------------
@@ -72,23 +72,208 @@ class LapHistoryWidget(QtWidgets.QTableWidget):
 
 class AnalyticsWidget(QtWidgets.QWidget):
     """
-    Placeholder for future PySpark integration.
+    Real-time analytics display powered by PySpark aggregations.
+    Consumes from the f1-analytics Kafka topic and visualizes lap metrics.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.analytics_data = {}  # lap_count -> analytics_dict
+        
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
         
-        self.label = QtWidgets.QLabel("ANALYTICS ENGINE\n[OFFLINE]")
-        self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.label.setStyleSheet("font-family: 'Impact'; font-size: 24px; color: #555555;")
-        layout.addWidget(self.label)
+        # Header
+        header = QtWidgets.QLabel("LAP ANALYTICS")
+        header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setStyleSheet("font-family: 'Impact'; font-size: 32px; color: #00aaff;")
+        layout.addWidget(header)
         
-        self.sub_label = QtWidgets.QLabel("Waiting for PySpark Stream...")
-        self.sub_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.sub_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #444444;")
-        layout.addWidget(self.sub_label)
+        # Status Label
+        self.status_label = QtWidgets.QLabel("Connecting to analytics stream...")
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.status_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #888888;")
+        layout.addWidget(self.status_label)
         
-        self.setStyleSheet("background-color: #0f0f0f; border: 1px dashed #333333;")
+        # Lap Comparison Table
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "LAP", "AVG SPEED", "MAX SPEED", "FUEL USED", "THROTTLE %", "LAP TIME", "SAMPLES",
+            "FUEL/LAP", "TIRE DEG", "AGGRO"
+        ])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: #1a1a1a;
+                color: #ffffff;
+                border: 1px solid #333333;
+                font-family: 'Courier New';
+                font-size: 14px;
+            }
+            QHeaderView::section {
+                background-color: #333333;
+                color: #00aaff;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+        """)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.table, stretch=3)
+        
+        # Summary Stats
+        stats_group = QtWidgets.QGroupBox("SESSION SUMMARY")
+        stats_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 16px;
+                color: #00aaff;
+                border: 2px solid #333;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 5px;
+            }
+        """)
+        stats_layout = QtWidgets.QHBoxLayout(stats_group)
+        
+        self.lbl_total_laps = QtWidgets.QLabel("LAPS\n0")
+        self.lbl_total_laps.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_total_laps.setStyleSheet("background-color: #222; border-radius: 5px; padding: 15px; font-size: 18px; color: #ffffff;")
+        
+        self.lbl_best_lap = QtWidgets.QLabel("BEST LAP\n--")
+        self.lbl_best_lap.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_best_lap.setStyleSheet("background-color: #222; border-radius: 5px; padding: 15px; font-size: 18px; color: #00ff00;")
+        
+        self.lbl_avg_lap = QtWidgets.QLabel("AVG LAP\n--")
+        self.lbl_avg_lap.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_avg_lap.setStyleSheet("background-color: #222; border-radius: 5px; padding: 15px; font-size: 18px; color: #feab3a;")
+        
+        stats_layout.addWidget(self.lbl_total_laps)
+        stats_layout.addWidget(self.lbl_best_lap)
+        stats_layout.addWidget(self.lbl_avg_lap)
+        
+        layout.addWidget(stats_group, stretch=1)
+        
+        self.setStyleSheet("background-color: #0f0f0f;")
+    
+    
+    def add_lap_data(self, lap_data):
+        """Silently add lap data to internal storage."""
+        lap_num = lap_data.get('lap_count', 0)
+        if lap_num <= 0:
+            return
+        self.analytics_data[lap_num] = lap_data
+
+    def refresh_ui(self):
+        """Refresh the entire analytics UI once."""
+        if not self.analytics_data:
+            return
+        
+        # Update status
+        last_lap = max(self.analytics_data.keys())
+        self.status_label.setText(f"✓ Connected | Last Update: Lap {last_lap}")
+        self.status_label.setStyleSheet("font-family: 'Arial'; font-size: 14px; color: #00ff00;")
+        
+        # Performance: Pre-calculate best lap info once to avoid O(N^2) loops
+        lap_times = [(l, d.get('last_lap_time_s', float('inf'))) for l, d in self.analytics_data.items() if d.get('last_lap_time_s', 0) > 0]
+        self.best_lap_num = min(lap_times, key=lambda x: x[1])[0] if lap_times else None
+        
+        self.refresh_table()
+        self.refresh_summary()
+    
+    def refresh_table(self):
+        """Refresh the lap comparison table."""
+        self.table.setRowCount(0)
+        
+        for lap_num in sorted(self.analytics_data.keys(), reverse=True):
+            data = self.analytics_data[lap_num]
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            
+            # Lap Number
+            self.table.setItem(row, 0, self._create_item(str(lap_num), center=True))
+            
+            # Avg Speed
+            avg_speed = data.get('avg_speed_kmh', 0)
+            self.table.setItem(row, 1, self._create_item(f"{avg_speed:.1f}", center=True))
+            
+            # Max Speed
+            max_speed = data.get('max_speed_kmh', 0)
+            self.table.setItem(row, 2, self._create_item(f"{max_speed:.1f}", center=True))
+            
+            # Fuel Used
+            fuel_used = data.get('fuel_used_kg', 0)
+            self.table.setItem(row, 3, self._create_item(f"{fuel_used:.2f}", center=True))
+            
+            # Throttle %
+            throttle_pct = data.get('throttle_pct', 0)
+            self.table.setItem(row, 4, self._create_item(f"{throttle_pct:.1f}%", center=True))
+            
+           
+            # Lap Time
+            lap_time = data.get('last_lap_time_s', 0)
+            if lap_time > 0:
+                item = self._create_item(f"{lap_time:.3f}", center=True)
+                # Use pre-calculated best lap number
+                if getattr(self, 'best_lap_num', None) == lap_num:
+                    item.setForeground(QtGui.QColor('#00ff00'))
+                self.table.setItem(row, 5, item)
+            else:
+                self.table.setItem(row, 5, self._create_item("--", center=True))
+            
+            # Sample Count
+            samples = data.get('sample_count', 0)
+            self.table.setItem(row, 6, self._create_item(str(samples), center=True))
+            
+            # Additional Metrics (Spark)
+            fuel_per = data.get('fuel_per_lap', 0)
+            self.table.setItem(row, 7, self._create_item(f"{fuel_per:.2f}", center=True))
+            
+            tire_deg = data.get('tire_deg_rate', 0)
+            self.table.setItem(row, 8, self._create_item(f"{tire_deg:.2f}", center=True))
+            
+            aggro = data.get('aggression_index', 0)
+            self.table.setItem(row, 9, self._create_item(f"{aggro:.1f}", center=True))
+    
+    def refresh_summary(self):
+        """Update session summary statistics."""
+        if not self.analytics_data:
+            return
+        
+        # Total laps
+        total_laps = len(self.analytics_data)
+        self.lbl_total_laps.setText(f"LAPS\n{total_laps}")
+        
+        # Best lap - calculate from available data
+        lap_times = [(lap, data.get('last_lap_time_s', float('inf'))) 
+                    for lap, data in self.analytics_data.items() 
+                    if data.get('last_lap_time_s', 0) > 0]
+        
+        if lap_times:
+            best_lap_num, best_time = min(lap_times, key=lambda x: x[1])
+            self.lbl_best_lap.setText(f"BEST LAP\nL{best_lap_num}: {best_time:.3f}s")
+            
+            # Average lap time
+            valid_times = [t for _, t in lap_times if t < float('inf')]
+            if valid_times:
+                avg_time = sum(valid_times) / len(valid_times)
+                self.lbl_avg_lap.setText(f"AVG LAP\n{avg_time:.3f}s")
+    
+
+    
+    def _create_item(self, text, center=False):
+        """Helper to create table items."""
+        item = QtWidgets.QTableWidgetItem(text)
+        if center:
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+        return item
 
 # -----------------------------------------------------------------------------
 # 2. MAIN DASHBOARD APPLICATION
@@ -114,7 +299,7 @@ class DashboardApp(QtWidgets.QMainWindow):
         self.last_idx = -1
         self.fastest_lap_time = float('inf')
         
-        # Kafka Setup
+        # Kafka Setup - Telemetry Consumer
         try:
             self.consumer = KafkaConsumer(
                 KAFKA_TOPIC,
@@ -124,10 +309,25 @@ class DashboardApp(QtWidgets.QMainWindow):
                 group_id=VIZ_GROUP_ID,
                 api_version=KAFKA_API_VERSION
             )
-            print(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
+            print(f"[DASHBOARD] Connected to Kafka telemetry: {KAFKA_BOOTSTRAP_SERVERS}")
         except Exception as e:
-            print(f"Kafka Error: {e}")
+            print(f"[DASHBOARD] Kafka Error: {e}")
             self.consumer = None
+        
+        # Kafka Setup - Analytics Consumer
+        try:
+            self.analytics_consumer = KafkaConsumer(
+                ANALYTICS_TOPIC,
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                auto_offset_reset='earliest',  # Get all analytics for current session
+                group_id='dashboard-analytics-v6', # New group to ensure we get everything
+                api_version=KAFKA_API_VERSION
+            )
+            print(f"[DASHBOARD] Connected to analytics topic: {ANALYTICS_TOPIC} (earliest)")
+        except Exception as e:
+            print(f"[DASHBOARD] Analytics topic not available: {e}")
+            self.analytics_consumer = None
 
         self.init_ui()
         
@@ -370,6 +570,33 @@ class DashboardApp(QtWidgets.QMainWindow):
 
         if last_state:
             self.render_state(last_state)
+        
+        # Update analytics
+        self.update_analytics()
+    
+    def update_analytics(self):
+        """Poll analytics consumer and update analytics widget."""
+        if not self.analytics_consumer:
+            return
+        
+        try:
+            # Poll with larger batch size to drain the Kafka buffer quickly
+            msgs = self.analytics_consumer.poll(timeout_ms=0, max_records=100)
+            updated = False
+            if msgs:
+                for tp, messages in msgs.items():
+                    for msg in messages:
+                        self.analytics_widget.add_lap_data(msg.value)
+                        updated = True
+                
+                # Refresh UI only ONCE after draining the entire batch
+                if updated:
+                    self.analytics_widget.refresh_ui()
+        except Exception as e:
+            # Print the error instead of silently failing
+            print(f"[DASHBOARD] Analytics error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def render_state(self, state):
         # Update Car Position

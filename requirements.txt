@@ -5,3 +5,4 @@ pandas
 scipy
 pyqtgraph
 PySide6
+pyspark

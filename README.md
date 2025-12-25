@@ -37,6 +37,18 @@ This project mimics a professional event-driven architecture used in motorsport 
     - Shows how to have *multiple* consumers on the same topic: `storage` runs completely independently of `dashboard`.
     - It consumes the same Kafka stream but writes every single data point to an InfluxDB bucket for later analysis (e.g., comparing laps).
 
+### 5. ⚡ Analytics Engine (The "Performance Analyst")
+*   **Path**: `analytics/spark_streaming.py`
+*   **Role**: Real-time Lap Aggregation & Insights.
+*   **Tech**: **Apache Spark Structured Streaming**.
+*   **How it works**:
+    - Consumes the high-frequency telemetry stream (100Hz) from Kafka.
+    - Uses **windowing** and **watermarking** to aggregate data by lap.
+    - Computes lap-level metrics: avg/max speed, throttle %, fuel usage, G-forces.
+    - Publishes aggregated analytics to `f1-analytics` Kafka topic.
+    - Dashboard consumes from this topic for lap comparisons without impacting real-time telemetry.
+    - Runs as **separate process** with micro-batching (5s intervals) for optimal performance.
+
 ---
 
 ## 🛠️ Setup & Usage
@@ -45,6 +57,7 @@ This project mimics a professional event-driven architecture used in motorsport 
 1.  **Python 3.10+**
 2.  **Apache Kafka**: Running locally (configured in `config.py` as `localhost:9094`).
 3.  **InfluxDB v2**: Running locally (configured in `config.py` as `localhost:8086`).
+4.  **Apache Spark**: PySpark will be installed via pip (local mode).
 
 ### Installation
 ```bash
@@ -53,7 +66,7 @@ pip install -r requirements.txt
 
 ### 🏁 Running the Pipeline
 
-Open **3 separate terminal windows** to run the full distributed system:
+You can run the full distributed system with **4 separate terminals**:
 
 **Terminal 1: Start the Simulation**
 ```bash
@@ -61,13 +74,23 @@ python3 simulator/transmitter.py
 ```
 > *Output: "Sent: T=12.45 Speed=280 km/h..."*
 
-**Terminal 2: Open the Dashboard**
+**Terminal 2: Start the Analytics Engine (Optional)**
+```bash
+# First-time setup: Create analytics Kafka topic
+python3 analytics/setup_kafka.py
+
+# Run the analytics streaming job
+python3 analytics/spark_streaming.py
+```
+> *Output: Lap-level analytics printed to console and published to Kafka*
+
+**Terminal 3: Open the Dashboard**
 ```bash
 python3 dashboard/app.py
 ```
-> *A window will open showing the live car telemetry.*
+> *A window will open showing live telemetry. Click ANALYTICS tab to see lap metrics.*
 
-**Terminal 3: Start Storage Ingestion**
+**Terminal 4: Start Storage Ingestion (Optional)**
 ```bash
 python3 storage/ingest.py
 ```
@@ -77,4 +100,15 @@ python3 storage/ingest.py
 Check `config.py` to adjust:
 - `PHYSICS_FREQUENCY`: Simulation update rate (default 100Hz).
 - `VISUALIZATION_FPS`: Dashboard refresh rate.
+- `SPARK_TRIGGER_INTERVAL`: Analytics micro-batch interval (default 5 seconds).
+- `SPARK_MASTER`: Spark cores for analytics (default "local[4]").
 - Kafka & InfluxDB connection strings and topic names.
+
+## 📊 Analytics Performance
+
+**Why Analytics Won't Bottleneck:**
+- Runs in **separate process** from telemetry
+- Uses **aggregation-only** workload (summaries, not full storage)
+- **Micro-batching** (5s intervals) reduces overhead
+- **Watermarking** prevents unbounded state growth
+- Parallel execution across multiple cores
